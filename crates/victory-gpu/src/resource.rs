@@ -1748,9 +1748,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         _ => footprint(&d).map_or(1, |info| info.size.max(1)),
     };
     let end = address.saturating_add(size);
-    // The title's pages for it may not be there yet (streaming): nothing to
-    // show, and the console's whole address space would not fit in memory.
-    if !cfg!(test) && !crate::texture::committed(address as *const u8, size as usize) {
+    // A streamed mip may arrive before either end of the texture. Staging
+    // copies resident bytes and supplies zeros for the missing pages.
+    if !cfg!(test) && !crate::texture::any_resident(address as *const u8, size as usize) {
         return None;
     }
     let mut out = std::ptr::null();
