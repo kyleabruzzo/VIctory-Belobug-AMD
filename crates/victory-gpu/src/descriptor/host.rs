@@ -333,6 +333,40 @@ const SLOT_CHUNK: usize = 512;
 const URGENT: usize = 2048;
 
 impl Bindless {
+    fn next_recheck(&self, frame: u64, always: bool) -> u64 {
+        let Some(&(last, _)) = self.recheck.front() else {
+            return u64::MAX;
+        };
+        let due = last.saturating_add(if always { 1 } else { RECHECK_FRAMES });
+        if !always && self.rechecks.0 == frame && self.rechecks.1 >= RECHECKS {
+            due.max(frame.saturating_add(1))
+        } else {
+            due
+        }
+    }
+
+    fn take_rechecks(&mut self, frame: u64, always: bool, due: &mut Vec<crate::object::This>) {
+        let limit = if always {
+            usize::MAX
+        } else if self.rechecks.0 == frame {
+            RECHECKS.saturating_sub(self.rechecks.1) as usize
+        } else {
+            RECHECKS as usize
+        };
+        let interval = if always { 1 } else { RECHECK_FRAMES };
+        let count = self
+            .recheck
+            .iter()
+            .take(limit)
+            .take_while(|(last, _)| last.saturating_add(interval) <= frame)
+            .count();
+        due.extend(
+            self.recheck
+                .drain(..count)
+                .map(|(_, texture)| texture as crate::object::This),
+        );
+    }
+
     /// The slot-making budget, refilled for the time passed since.
     fn budget(&mut self) -> &mut [u64; 2] {
         let now = std::time::Instant::now();
@@ -1626,7 +1660,8 @@ impl HostHeap {
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
         let live = evictions.then(crate::resource::placed_live);
-        let (todo, due) = {
+        let always = crate::resource::textures() == crate::resource::Textures::Always;
+        let (todo, due, check_after_slots) = {
             // The submission may hold the heap's lock for a while: the work
             // waits for a later draw rather than this one waiting.
             let mut b = match self.bindless.try_lock() {
@@ -1666,23 +1701,19 @@ impl HostHeap {
                     }
                 }
             }
-            let always = crate::resource::textures() == crate::resource::Textures::Always;
-            let rechecks = due.len() + RECHECKS as usize;
-            while (due.len() < rechecks && (b.rechecks.0 != frame || b.rechecks.1 < RECHECKS)
-                || always)
-                && let Some(&(f, t)) = b.recheck.front()
-                && f + if always { 1 } else { RECHECK_FRAMES } <= frame
-            {
-                b.recheck.pop_front();
-                due.push(t as crate::object::This);
+            // An already known texture reached by a changed slot can also use
+            // a recheck. Give those slots first use of the quota, then remove
+            // only as many periodic entries as can still be serviced.
+            let check_after_slots =
+                (!todo.is_empty() || !due.is_empty()) && b.next_recheck(frame, always) <= frame;
+            if !check_after_slots {
+                b.take_rechecks(frame, always, &mut due);
             }
-            self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
-                Ordering::Release,
-            );
+            self.recheck_at
+                .store(b.next_recheck(frame, always), Ordering::Release);
             self.record_hint
                 .store(!b.record_pending.is_empty(), Ordering::Release);
-            (todo, due)
+            (todo, due, check_after_slots)
         };
         if todo.is_empty() && due.is_empty() {
             return;
@@ -1714,13 +1745,13 @@ impl HostHeap {
         }
         over.extend(todo.map(|(i, _)| i));
         reached.extend(due);
-        for texture in reached {
+        let prepare_texture = |texture| {
             // The texture may be evicted meanwhile: a reference keeps it.
             let Some(_held) = crate::resource::hold_placed(texture) else {
-                continue;
+                return;
             };
             let Some(host_tex) = crate::resource::host_resource(texture) else {
-                continue;
+                return;
             };
             if crate::texture::title_written(host_tex) && self.upload_due(texture, host_tex, frame)
             {
@@ -1729,6 +1760,21 @@ impl HostHeap {
             }
             const SHADER_RESOURCE: u32 = 0x40 | 0x80;
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
+        };
+        for texture in reached {
+            prepare_texture(texture);
+        }
+        if check_after_slots {
+            let mut due = Vec::new();
+            {
+                let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                b.take_rechecks(frame, always, &mut due);
+                self.recheck_at
+                    .store(b.next_recheck(frame, always), Ordering::Release);
+            }
+            for texture in due {
+                prepare_texture(texture);
+            }
         }
         {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
@@ -1813,7 +1859,7 @@ impl HostHeap {
                 .insert(texture as usize, (host.clone(), frame));
             b.recheck.push_back((frame, texture as usize));
             self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+                b.next_recheck(frame, mode == crate::resource::Textures::Always),
                 Ordering::Release,
             );
         }
@@ -3901,6 +3947,43 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn periodic_rechecks_keep_the_queue_when_only_one_check_remains() {
+        let frame = RECHECK_FRAMES + 20;
+        let mut b = Bindless::default();
+        b.rechecks = (frame, RECHECKS - 1);
+        b.recheck.extend([(0, 1), (0, 2), (0, 3), (frame, 4)]);
+        let mut due = Vec::new();
+        b.take_rechecks(frame, false, &mut due);
+        assert_eq!(due, [1 as crate::object::This]);
+
+        // The direct slot work plus the one queued check exhaust this frame.
+        b.rechecks.1 += 1;
+        assert_eq!(b.next_recheck(frame, false), frame + 1);
+        b.take_rechecks(frame, false, &mut due);
+        assert_eq!(due.len(), 1);
+
+        due.clear();
+        b.take_rechecks(frame + 1, false, &mut due);
+        assert_eq!(due, [2 as crate::object::This, 3 as crate::object::This]);
+        assert_eq!(b.next_recheck(frame + 1, false), frame + RECHECK_FRAMES);
+    }
+
+    #[test]
+    fn periodic_rechecks_in_always_mode_use_next_frame_even_with_full_quota() {
+        let mut b = Bindless::default();
+        b.rechecks = (20, RECHECKS);
+        b.recheck.extend([(19, 1), (19, 2), (20, 3)]);
+        let mut due = Vec::new();
+        assert_eq!(b.next_recheck(20, true), 20);
+        b.take_rechecks(20, true, &mut due);
+        assert_eq!(due, [1 as crate::object::This, 2 as crate::object::This]);
+        assert_eq!(b.next_recheck(20, true), 21);
+        b.take_rechecks(21, true, &mut due);
+        assert_eq!(due[2], 3 as crate::object::This);
+        assert_eq!(b.next_recheck(21, true), u64::MAX);
     }
 
     /// Placed textures reached through slots upload the first time, then
