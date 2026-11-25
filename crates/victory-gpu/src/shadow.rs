@@ -35,7 +35,7 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Whether the memory is write-watched: unknown, yes, no.
+    /// Watch mode of a uniform buffer. Sparse buffers probe each range independently.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
@@ -50,7 +50,7 @@ pub(crate) struct Shadow {
     unwatched: Mutex<std::collections::HashMap<(usize, usize), u64>>,
     /// Ranges already guarded and copied at `region_epoch(from, to)` (O(1) fast
     /// path when no guard fault/remap/rewrite occurred in those 64 MiB regions).
-    clean_spans: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    clean_spans: GuardedSpans,
     /// The buffer has memory only where it was brought up to date.
     sparse: Option<Sparse>,
     /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state (`card.rs`).
@@ -209,6 +209,84 @@ fn give_back(v: Vec<u8>) {
 const NOT_WATCHED: u8 = 2;
 const WATCHED_GUARDED: u8 = 3;
 
+#[derive(Default)]
+struct GuardedSpans(Mutex<std::collections::HashMap<(usize, usize), u64>>);
+
+impl GuardedSpans {
+    /// A sparse buffer can cover several Windows allocations. Only a single
+    /// allocation can use the last observed watch mode for the whole buffer.
+    fn update(
+        &self,
+        watched: &AtomicU8,
+        sparse: bool,
+        from: usize,
+        to: usize,
+        always: u8,
+        copy: impl FnOnce(u64, &[(usize, u64)]) -> usize,
+    ) -> Option<usize> {
+        let mode = watched.load(Ordering::Relaxed);
+        if mode == NOT_WATCHED || always == 1 || always == 3 && mode == WATCHED_GUARDED {
+            return None;
+        }
+        let allow_guard = !sparse || always != 3;
+        if allow_guard && (sparse || mode == WATCHED_GUARDED) {
+            let ge = crate::watch::region_epoch(from, to);
+            if self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&(from, to)) == Some(&ge) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return Some(0);
+            }
+        }
+        // After a remap the same address can be a private allocation with
+        // native write-watch. A stale guard epoch must re-probe its type.
+        let native = if mode != WATCHED_GUARDED {
+            crate::watch::writes(from, to, false)
+        } else {
+            None
+        };
+        let (now, written, guard_epoch) = if let Some((now, written)) = native {
+            (now, written, None)
+        } else if allow_guard {
+            let epoch = crate::watch::region_epoch(from, to);
+            match crate::watch::writes_guarded(from, to) {
+                Some((now, written)) => (now, written, Some(epoch)),
+                None => {
+                    if !sparse && mode != WATCHED_GUARDED {
+                        watched.store(NOT_WATCHED, Ordering::Relaxed);
+                    }
+                    return None;
+                }
+            }
+        } else {
+            return None;
+        };
+        if !sparse {
+            watched.store(if guard_epoch.is_some() { WATCHED_GUARDED } else { 1 }, Ordering::Relaxed);
+        }
+        let copied = copy(now, &written);
+        if let Some(ge) = guard_epoch
+            && crate::watch::region_epoch(from, to) == ge
+        {
+            let mut spans = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if spans.len() >= 8192 {
+                spans.clear();
+            }
+            spans.insert((from, to), ge);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+        }
+        Some(copied)
+    }
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -286,7 +364,7 @@ impl Shadow {
             before: Mutex::default(),
             direct: None,
             unwatched: Mutex::default(),
-            clean_spans: Mutex::default(),
+            clean_spans: GuardedSpans::default(),
             sparse: None,
             card,
         }
@@ -718,84 +796,16 @@ impl Shadow {
         static ALWAYS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let always = *ALWAYS
             .get_or_init(|| std::env::var("VICTORY_ALWAYS_COPY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-        let mut mode = self.watched.load(Ordering::Relaxed);
-        let forced = always == 1 || always == 3 && mode == WATCHED_GUARDED;
-        if forced {
-            mode = NOT_WATCHED;
+        let sparse = self.sparse.is_some();
+        let watched = self.clean_spans.update(
+            &self.watched, sparse, from, to, always,
+            |now, pages| self.copy_stale(from, to, now, pages),
+        );
+        if let Some(copied) = watched {
+            return copied;
         }
+        let forced = always == 1 || always == 3 && (sparse || self.watched.load(Ordering::Relaxed) == WATCHED_GUARDED);
         let lazy = lazy && !forced && always != 2;
-        if mode == WATCHED_GUARDED {
-            let ge = crate::watch::region_epoch(from, to);
-            {
-                let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                if spans.get(&(from, to)) == Some(&ge) {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        use crate::copystat::{C, add};
-                        add(C::Checked, (to - from) as u64);
-                        add(C::Unchanged, (to - from) as u64);
-                    }
-                    return 0;
-                }
-            }
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-                let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::region_epoch(from, to) == ge {
-                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                    if spans.len() >= 8192 {
-                        spans.clear();
-                    }
-                    spans.insert((from, to), ge);
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-                }
-                return copied;
-            }
-        } else if mode != NOT_WATCHED {
-            // Probe write-watch first; if that fails and guard succeeds, mark
-            // this shadow as guarded so subsequent calls skip GetWriteWatch.
-            if let Some((now, written)) = crate::watch::writes(from, to, false) {
-                self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-                }
-                return copied;
-            }
-            let ge = crate::watch::region_epoch(from, to);
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-                self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::region_epoch(from, to) == ge {
-                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                    if spans.len() >= 8192 {
-                        spans.clear();
-                    }
-                    spans.insert((from, to), ge);
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-                }
-                return copied;
-            }
-            // A sparse shadow spans a 2 GiB chunk that may contain both
-            // watchable mapped/private regions and unmapped holes: one
-            // unwatchable sub-range must not permanently disable watching for
-            // the rest of the chunk.
-            if self.sparse.is_none() {
-                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
-            }
-        }
         // shortcut: memory that cannot be watched (unmapped, mostly) is copied
         // once a frame.
         let frame = crate::queue::presented() + 1;
@@ -1045,7 +1055,7 @@ fn placed(
             dead: std::sync::atomic::AtomicBool::new(false),
         }),
         unwatched: Mutex::default(),
-        clean_spans: Mutex::default(),
+        clean_spans: GuardedSpans::default(),
         sparse: None,
         card: None,
     })
@@ -1870,7 +1880,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         before: Mutex::default(),
         direct: None,
         unwatched: Mutex::default(),
-        clean_spans: Mutex::default(),
+        clean_spans: GuardedSpans::default(),
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),
@@ -2589,6 +2599,63 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn sparse_shadow_probes_mapped_and_private_ranges_independently() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualAlloc,
+            VirtualFree,
+        };
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: create one pagefile view and one write-watch allocation
+        // owned by the test. Neither is accessed after it is released below.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE);
+            assert!(!view.Value.is_null());
+            CloseHandle(section);
+            let private = VirtualAlloc(
+                std::ptr::null_mut(), PAGE, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE,
+            );
+            assert!(!private.is_null());
+            let watch = GuardedSpans::default();
+            let mode = AtomicU8::new(0);
+            let a = view.Value as usize;
+            let b = private as usize;
+            let mut last_seen = std::collections::HashMap::new();
+            let mut track = |at| {
+                watch.update(&mode, true, at, at + PAGE, 0, |now, pages| {
+                    let previous = last_seen.insert(at, now).unwrap_or(0);
+                    usize::from(pages.iter().any(|&(page, when)| page == at / PAGE && when > previous))
+                })
+            };
+            assert_eq!(track(a), Some(1));
+            assert_eq!(track(a), Some(0));
+            private.cast::<u8>().write(1);
+            assert_eq!(track(b), Some(1));
+            assert_eq!(mode.load(Ordering::Relaxed), 0);
+            assert_eq!(track(b), Some(0));
+            assert!(crate::watch::try_open_guarded(a));
+            view.Value.cast::<u8>().write(1);
+            assert_eq!(track(a), Some(1));
+
+            crate::watch::title_memory_remapped(a, PAGE);
+            assert_eq!(track(a), Some(1));
+            assert_eq!(track(a), Some(0));
+            private.cast::<u8>().write(2);
+            assert_eq!(track(b), Some(1));
+            assert_eq!(mode.load(Ordering::Relaxed), 0);
+            crate::watch::title_memory_remapped(a, PAGE);
+            UnmapViewOfFile(view);
+            VirtualFree(private, 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
