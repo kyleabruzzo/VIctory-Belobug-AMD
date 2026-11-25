@@ -2,6 +2,10 @@
 
 On 25 November 2026 this Belobug-based build reached Lucia's prison cell on Windows 10. Two PresentMon captures at the same checkpoint measured **4.11 and 3.98 displayed FPS** on an RX 9070 XT. The figures describe the cell after loading. The loading artwork itself ran at about 30 FPS. [Measurements and frame timings](docs/alwayskyleab-prison/README.md)
 
+The current branch draws the `alwayskyleab` performance panel into the back buffer so game-window recordings include it. It displays FPS, frame time, the process's busiest GPU engine, CPU usage, working-set RAM and draws per frame. `VICTORY_HUD=0` hides it. `VICTORY_TEXTURE_MAX=adaptive-native` retains full requested mips for new streamed textures while local VRAM use is below 70% of budget, then uses 512- and 256-pixel limits as pressure rises.
+
+The renderer also includes changes adapted from DexNom for partially resident textures, quad-local pixel operations and restored wave64 visibility masks. The linked frame traces measure the earlier `bc5f578` revision. [DexNom texture and pixel changes](https://github.com/DexNom/VIctory/commit/921d8d3) · [DexNom visibility-mask fix](https://github.com/DexNom/VIctory/commit/76749ce)
+
 ## Upstream Belobug project
 
 This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
