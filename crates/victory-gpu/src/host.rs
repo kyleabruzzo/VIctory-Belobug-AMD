@@ -3660,37 +3660,27 @@ struct Presenter {
 }
 
 impl Presenter {
-    /// Writes the frame rate and frame time in the top left corner of
-    /// `back`, which is a render target on `list`.
+    fn prepare_readout(&mut self) {
+        let Some(sampler) = &self.meter.usage else { return };
+        let extent = (self.width, self.height);
+        if self.meter.panel.as_ref().is_none_or(|p| p.extent != extent) {
+            self.meter.panel = crate::readout::Panel::new(extent, self.meter.shown, sampler.latest());
+        }
+    }
+
+    /// Writes the cached performance readout in the corner of the back buffer.
     ///
     /// # Safety
     /// `back` is this swap chain's buffer, in the render target state.
     unsafe fn readout(&self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) {
-        let Some((fps, ms)) = self.meter.shown else { return };
-        if !crate::readout::on() {
-            return;
-        }
-        let text = format!("{fps:.1} FPS  {ms:.0} MS");
-        // Dots that keep their share of the picture at any size.
-        let dot = (self.height as i32 / 216).max(2);
-        let at = (dot * 3, dot * 3);
-        let (w, h) = crate::readout::size(&text);
-        let behind = RECT {
-            left: at.0,
-            top: at.1,
-            right: at.0 + w * dot,
-            bottom: at.1 + h * dot,
-        };
-        let marks = crate::readout::rects(&text, at, dot);
-        // SAFETY: our heap of one view, and rectangles inside the picture
-        // (a text of a few characters at this size).
+        let Some(panel) = &self.meter.panel else { return };
+        // SAFETY: our heap of one view and rectangles inside this back buffer.
         unsafe {
             let view = self.rtv.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, view);
-            if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
-                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
-            }
+            list.ClearRenderTargetView(view, &[0.012, 0.016, 0.024, 1.0], Some(&[panel.background]));
+            list.ClearRenderTargetView(view, &[0.25, 0.93, 0.82, 1.0], Some(&panel.brand));
+            list.ClearRenderTargetView(view, &[0.96, 0.97, 1.0, 1.0], Some(&panel.text));
         }
     }
 }
@@ -3704,12 +3694,14 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
-    /// The frames a second and milliseconds a frame of the last second.
-    shown: Option<(f64, f64)>,
+    /// FPS, milliseconds and draws per frame for the last measurement.
+    shown: Option<(f64, f64, f64)>,
+    usage: Option<crate::hud_usage::Sampler>,
+    panel: Option<crate::readout::Panel>,
 }
 
 impl Meter {
-    fn new() -> Self {
+    fn new(adapter: windows::Win32::Foundation::LUID) -> Self {
         let now = std::time::Instant::now();
         Meter {
             since: now,
@@ -3718,6 +3710,8 @@ impl Meter {
             logged: now,
             caption: None,
             shown: None,
+            usage: crate::readout::on().then(|| crate::hud_usage::Sampler::start(adapter)),
+            panel: None,
         }
     }
 
@@ -3738,7 +3732,8 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        self.shown = Some((fps, ms));
+        self.shown = Some((fps, ms, draws));
+        self.panel = None;
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -3801,10 +3796,14 @@ impl Meter {
             // SAFETY: a window handle and a buffer of that length.
             let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
             buffer.truncate(n.max(0) as usize);
+            if buffer.iter().copied().eq(crate::readout::BRAND.encode_utf16()) {
+                buffer.clear();
+            }
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let separator = if caption.is_empty() { "" } else { " | " };
+        let text = format!("{separator}{} {fps:.1} fps {ms:.1} ms/frame {draws:.0} draws/frame", crate::readout::BRAND);
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -3870,6 +3869,7 @@ impl Host {
                 }
             }
         }
+        p.prepare_readout();
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -3889,10 +3889,6 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -3902,6 +3898,17 @@ impl Host {
                 transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target),
             ]);
             p.readout(&self.device, list, &back);
+            #[cfg(feature = "diagnostics")]
+            let capture = if crate::capture::wanted(frame) {
+                list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let image = crate::capture::read_back(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                image
+            } else {
+                list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
+                None
+            };
+            #[cfg(not(feature = "diagnostics"))]
             list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
             self.execute(&[&p.copy]);
@@ -3949,6 +3956,7 @@ impl Host {
             .ok()?;
             (p.width, p.height, p.format) = (width, height, format);
         }
+        p.prepare_readout();
         let view = |d: &D3D12_RESOURCE_DESC| swap_format(d.Format);
         let planes = [
             scene.and_then(|s| Some((s.0, view(&a?)?))),
@@ -4043,7 +4051,7 @@ impl Host {
                 format,
                 copy,
                 hwnd,
-                meter: Meter::new(),
+                meter: Meter::new(self.device.GetAdapterLuid()),
                 rtv,
             })
         }
@@ -4440,7 +4448,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("alwayskyleab"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

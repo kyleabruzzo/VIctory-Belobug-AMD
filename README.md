@@ -294,6 +294,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_HUD=1` or `0` | show or hide the recorded performance panel independently of the FPS cap. CPU is the game's share of all logical processors, GPU is its busiest engine on the rendering adapter, and RAM is its working set. Unavailable readings show N/A. |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
