@@ -11,6 +11,9 @@ use std::ptr::NonNull;
 
 use victory_formats::texture;
 
+#[cfg(windows)]
+mod texture_cap;
+
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
@@ -1124,17 +1127,20 @@ thread_local! {
 /// How much of the video memory we may use is in use, in percent, as last
 /// asked a little while ago.
 #[cfg(windows)]
-fn video_memory_percent() -> u64 {
-    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> =
-        std::sync::Mutex::new((None, 0));
+fn video_memory_pressure() -> texture_cap::Budget {
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::Mutex<Option<(Instant, texture_cap::Budget)>> =
+        std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if last.0.is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(50)) {
-        last.0 = Some(std::time::Instant::now());
-        if let Some([(used, budget), _]) = crate::host::video_memory() {
-            last.1 = used * 100 / budget.max(1);
-        }
+    if let Some((at, sample)) = *last
+        && at.elapsed() <= Duration::from_millis(50)
+    {
+        return sample;
     }
-    last.1
+    let mut sample = last.map_or_else(Default::default, |(_, previous)| previous);
+    sample.observe(crate::host::video_memory().map(|[local, _]| local));
+    *last = Some((Instant::now(), sample));
+    sample
 }
 
 /// How many of a streamed texture's largest mips to do without, for none of
@@ -1143,20 +1149,14 @@ fn video_memory_percent() -> u64 {
 /// cost seconds a frame, or the driver failed.
 #[cfg(windows)]
 fn over_cap(d: &ResourceDesc) -> u32 {
-    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let set = *SET.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_MAX")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    });
     if !STREAMED.get() || textures() != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    static SET: std::sync::OnceLock<texture_cap::TextureCap> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        texture_cap::TextureCap::parse(std::env::var("VICTORY_TEXTURE_MAX").ok().as_deref())
     });
+    let max = set.limit(video_memory_pressure);
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
     if cfg!(test)
