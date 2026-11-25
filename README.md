@@ -1,4 +1,8 @@
-# VIctory fork for AMD Radeon (work in progress)
+# alwayskyleab's VIctory Radeon benchmark branch
+
+On 25 November 2026 this Belobug-based build reached Lucia's prison cell on Windows 10. Two PresentMon captures at the same checkpoint measured **4.11 and 3.98 displayed FPS** on an RX 9070 XT. The figures describe the cell after loading. The loading artwork itself ran at about 30 FPS. [Measurements and frame timings](docs/alwayskyleab-prison/README.md)
+
+## Upstream Belobug project
 
 This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
 and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
@@ -9,7 +13,7 @@ the game's world on one AMD card.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
-## State of this fork (2026-11-25)
+## Upstream Belobug results (2026-11-25)
 
 **Not playable yet: 5 to 7 frames per second.** Tested on one machine only:
 Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
