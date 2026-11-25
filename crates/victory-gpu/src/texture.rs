@@ -303,7 +303,7 @@ impl Staging {
             }
             self.not_watched.store(true, Ordering::Relaxed);
         }
-        // Check backoff BEFORE probing `committed` (which touches every page):
+        // Check backoff before probing the texture's residency:
         // static textures skip both page probing and BLAKE3 hashing in O(1),
         // while `title_memory_written` still flips `rewritten` immediately.
         let frame = crate::queue::presented() + 1;
@@ -319,13 +319,13 @@ impl Staging {
         {
             return (0, false);
         }
-        if !committed(self.memory, size) {
+        if !any_resident(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
                 size,
                 desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
+                "a sampled texture has no resident pages"
             );
             return (0, false);
         }
@@ -545,6 +545,41 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
             *read = Vec::new();
         }
     });
+}
+
+/// Whether any bytes in a sampled texture can be read. A streamed texture
+/// can have resident mip levels between two unmapped regions.
+pub(crate) fn any_resident(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let start = at as usize;
+    let Some(end) = start.checked_add(len) else { return false };
+    if len == 0 {
+        return false;
+    }
+    // One byte is cheaper than querying the extent of the title's large pools.
+    if crate::host::read_into(at, &mut [0]) {
+        return true;
+    }
+    if start / 4096 == (end - 1) / 4096 {
+        return false;
+    }
+    let mut p = start;
+    while p < end {
+        // SAFETY: the query describes the address without dereferencing it.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if n != size_of_val(&info) || next <= p {
+            break;
+        }
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_EXECUTE) == 0 {
+            return true;
+        }
+        p = next;
+    }
+    false
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1067,6 +1102,36 @@ mod tests {
 #[cfg(test)]
 mod read_tests {
     use super::*;
+
+    #[test]
+    fn sparse_texture_admits_a_resident_middle_mip_and_zeroes_the_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: this test owns the reservation and only writes to its committed middle block.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            middle.write_bytes(0x5a, BLOCK);
+            assert!(!any_resident(base, 0));
+            assert!(!any_resident(base, 2 * BLOCK));
+            assert!(any_resident(base, 2 * BLOCK + 1));
+            assert!(any_resident(middle, 3 * BLOCK));
+            assert!(!any_resident(base.add(3 * BLOCK), 2 * BLOCK));
+            with_tiled_copy(base, 5 * BLOCK, |tiled| {
+                assert!(tiled[..2 * BLOCK].iter().all(|&b| b == 0));
+                assert!(tiled[2 * BLOCK..3 * BLOCK].iter().all(|&b| b == 0x5a));
+                assert!(tiled[3 * BLOCK..].iter().all(|&b| b == 0));
+            });
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert!(!any_resident(base, 5 * BLOCK));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     #[test]
     fn watched_texture_reads_reuse_space_and_expose_only_current_bytes() {

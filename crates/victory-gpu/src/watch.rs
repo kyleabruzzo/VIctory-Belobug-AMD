@@ -95,20 +95,42 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
-struct Journal {
-    /// Numbers the askings; 0 is "never".
-    asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// Room for the kernel's answer.
-    found: Vec<usize>,
+// Reset and publication must be indivisible to another query touching any of
+// the same console pages. Disjoint queries can enter the kernel in parallel.
+// One stripe covers 4 MiB; indices repeat every 256 MiB (a collision only
+// serializes more work). Multi-stripe requests always lock in index order.
+const QUERY_STRIPES: usize = u64::BITS as usize;
+const PAGES_PER_STRIPE: usize = (4 << 20) / PAGE;
+static QUERIES: [Mutex<()>; QUERY_STRIPES] = [const { Mutex::new(()) }; QUERY_STRIPES];
+static ASKED: AtomicU64 = AtomicU64::new(0);
+static WRITTEN: std::sync::RwLock<BTreeMap<usize, u64>> = std::sync::RwLock::new(BTreeMap::new());
+
+fn stripe_mask(first: usize, last: usize) -> u64 {
+    if first >= last {
+        return 0;
+    }
+    let begin = first / PAGES_PER_STRIPE;
+    let count = (last - 1) / PAGES_PER_STRIPE - begin + 1;
+    if count >= QUERY_STRIPES {
+        return u64::MAX;
+    }
+    ((1u64 << count) - 1).rotate_left((begin % QUERY_STRIPES) as u32)
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
-    asked: 0,
-    written: BTreeMap::new(),
-    found: Vec::new(),
-});
+fn while_checking<T>(first: usize, last: usize, check: impl FnOnce() -> T) -> T {
+    let mut mask = stripe_mask(first, last);
+    if mask.is_power_of_two() {
+        let _guard = QUERIES[mask.trailing_zeros() as usize].lock().unwrap_or_else(|e| e.into_inner());
+        return check();
+    }
+    let mut held = Vec::with_capacity(mask.count_ones() as usize);
+    while mask != 0 {
+        let index = mask.trailing_zeros() as usize;
+        held.push(QUERIES[index].lock().unwrap_or_else(|e| e.into_inner()));
+        mask &= mask - 1;
+    }
+    check()
+}
 
 /// Several dirty kernel pages can describe one console page. Only adjacent
 /// duplicates are discarded, so the kernel's answer may be in any order.
@@ -119,90 +141,84 @@ fn dirty_console_pages(addresses: &[usize]) -> impl Iterator<Item = usize> + '_ 
     })
 }
 
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
+type History = (u64, Vec<(usize, u64)>);
+
+fn publish(first: usize, last: usize, pages: impl IntoIterator<Item = usize>) -> History {
+    let mut pages = pages.into_iter().peekable();
+    let snapshot = |written: &BTreeMap<usize, u64>| {
+        written.range(first..last).map(|(&p, &w)| (p, w)).collect()
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    // Allocate the epoch with the journal locked. A concurrent runtime write
+    // published before this snapshot therefore cannot receive a later epoch.
+    if pages.peek().is_none() {
+        let history = WRITTEN.read().unwrap_or_else(|e| e.into_inner());
+        return (ASKED.fetch_add(1, Ordering::Relaxed) + 1, snapshot(&history));
     }
-    j.asked += 1;
-    let now = j.asked;
-    for page in dirty_console_pages(&j.found[..count]).chain(guarded) {
-        j.written.insert(page, now);
+    let mut history = WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+    let now = ASKED.fetch_add(1, Ordering::Relaxed) + 1;
+    for page in pages {
+        history.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    (now, snapshot(&history))
 }
 
-/// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
-/// view memory: skips the `GetWriteWatch` syscall (which always fails on
-/// mapped views).
-pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+/// The pages of `[start, end)` (whole pages) as last written, for pages
+/// written since tracking began: `(page number, asking)` in page order.
+/// `None` if the memory is not write-watched (nor, with `guarded`, a view).
+pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<History> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    let guarded = guard(first * PAGE, last * PAGE)?;
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-    }
-    j.asked += 1;
-    let now = j.asked;
-    for page in guarded {
-        j.written.insert(page, now);
-    }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    while_checking(first, last, || FOUND.with_borrow_mut(|found| {
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        if found.len() < count {
+            found.resize(count, 0);
+        }
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the thread's scratch holds at least `count` answer entries.
+        let failed = unsafe {
+            GetWriteWatch(WRITE_WATCH_FLAG_RESET, (first * PAGE) as *const _, (last - first) * PAGE,
+                found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        } != 0;
+        let mapped = if failed {
+            if !guarded {
+                return None;
+            }
+            count = 0;
+            guard(first * PAGE, last * PAGE)?
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        Some(publish(first, last, dirty_console_pages(&found[..count]).chain(mapped)))
+    }))
+}
+
+/// Same as [`writes`] for memory known to be guarded mapped view memory.
+pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<History> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    while_checking(first, last, || {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let guarded = guard(first * PAGE, last * PAGE)?;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        Some(publish(first, last, guarded))
+    })
 }
 
 /// Guarded blocks of view memory.
@@ -929,11 +945,10 @@ pub fn title_memory_written(at: usize, len: usize) {
         // arrived kept what the memory held then for good (meshes read as
         // zeros: walls, floors and bodies missing, others each launch).
         {
-            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            j.asked += 1;
-            let now = j.asked;
+            let mut history = WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+            let now = ASKED.fetch_add(1, Ordering::Relaxed) + 1;
             for page in at / PAGE..(at + len).div_ceil(PAGE) {
-                j.written.insert(page, now);
+                history.insert(page, now);
             }
         }
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
@@ -1061,6 +1076,48 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn overlapping_pages_share_a_gate_across_stripe_wraps() {
+        let wrap = QUERY_STRIPES * PAGES_PER_STRIPE;
+        assert_eq!(stripe_mask(10, 10), 0);
+        assert_eq!(stripe_mask(0, 1) & stripe_mask(PAGES_PER_STRIPE, PAGES_PER_STRIPE + 1), 0);
+        assert_eq!(stripe_mask(0, wrap * 2), u64::MAX);
+        for boundary in [PAGES_PER_STRIPE, wrap, wrap + PAGES_PER_STRIPE] {
+            let crossing = stripe_mask(boundary - 1, boundary + 1);
+            assert_eq!(crossing.count_ones(), 2);
+            for page in [boundary - 1, boundary] {
+                assert_ne!(crossing & stripe_mask(page, page + 1), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_native_resets_publish_the_same_write_to_all_askers() {
+        use std::sync::Barrier;
+        // SAFETY: two pages of write-watch memory owned by this test.
+        let ptr = unsafe { VirtualAlloc(std::ptr::null_mut(), 2 * PAGE,
+            MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(ptr, 0);
+        let (previous, _) = writes(ptr, ptr + 2 * PAGE, false).unwrap();
+        // SAFETY: the test owns the committed allocation.
+        unsafe { ((ptr + PAGE + 7) as *mut u8).write(1) };
+        let gate = Barrier::new(2);
+        let generation = |from, end| {
+            gate.wait();
+            let (_, changes) = writes(from, end, false).unwrap();
+            changes.into_iter().find(|(page, _)| *page == ptr / PAGE + 1).unwrap().1
+        };
+        let (one, two) = std::thread::scope(|s| {
+            let w = s.spawn(|| generation(ptr, ptr + 2 * PAGE));
+            let other = generation(ptr + PAGE + 1, ptr + 2 * PAGE);
+            (w.join().unwrap(), other)
+        });
+        assert_eq!(one, two);
+        assert!(one > previous);
+        // SAFETY: all workers are joined, and this is our allocation.
+        unsafe { VirtualFree(ptr as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// Two views of the same two physical pages, told as the runtime tells
     /// them: the two addresses.

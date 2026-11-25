@@ -11,6 +11,9 @@ use std::ptr::NonNull;
 
 use victory_formats::texture;
 
+#[cfg(windows)]
+mod texture_cap;
+
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
@@ -1124,17 +1127,20 @@ thread_local! {
 /// How much of the video memory we may use is in use, in percent, as last
 /// asked a little while ago.
 #[cfg(windows)]
-fn video_memory_percent() -> u64 {
-    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> =
-        std::sync::Mutex::new((None, 0));
+fn video_memory_pressure() -> texture_cap::Budget {
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::Mutex<Option<(Instant, texture_cap::Budget)>> =
+        std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if last.0.is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(50)) {
-        last.0 = Some(std::time::Instant::now());
-        if let Some([(used, budget), _]) = crate::host::video_memory() {
-            last.1 = used * 100 / budget.max(1);
-        }
+    if let Some((at, sample)) = *last
+        && at.elapsed() <= Duration::from_millis(50)
+    {
+        return sample;
     }
-    last.1
+    let mut sample = last.map_or_else(Default::default, |(_, previous)| previous);
+    sample.observe(crate::host::video_memory().map(|[local, _]| local));
+    *last = Some((Instant::now(), sample));
+    sample
 }
 
 /// How many of a streamed texture's largest mips to do without, for none of
@@ -1143,20 +1149,14 @@ fn video_memory_percent() -> u64 {
 /// cost seconds a frame, or the driver failed.
 #[cfg(windows)]
 fn over_cap(d: &ResourceDesc) -> u32 {
-    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let set = *SET.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_MAX")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    });
     if !STREAMED.get() || textures() != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    static SET: std::sync::OnceLock<texture_cap::TextureCap> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        texture_cap::TextureCap::parse(std::env::var("VICTORY_TEXTURE_MAX").ok().as_deref())
     });
+    let max = set.limit(video_memory_pressure);
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
     if cfg!(test)
@@ -1717,11 +1717,12 @@ pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. On failure, reports
+/// the guest byte span to watch for a subsequent mapping, when known.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Result<This, u64> {
     if address == 0 {
-        return None;
+        return Err(0);
     }
     // The description's padding holds anything; the same texture was made
     // up to four times for it. It holds the largest mip here.
@@ -1732,15 +1733,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
-        return None;
+        return Err(0);
     }
     if let Some(target) = target_at(address, &d) {
-        return Some(target);
+        return Ok(target);
     }
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
-            return Some(r as This);
+            return Ok(r as This);
         }
     }
     let size = match texture_layout(&d) {
@@ -1748,10 +1749,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         _ => footprint(&d).map_or(1, |info| info.size.max(1)),
     };
     let end = address.saturating_add(size);
-    // The title's pages for it may not be there yet (streaming): nothing to
-    // show, and the console's whole address space would not fit in memory.
-    if !cfg!(test) && !crate::texture::committed(address as *const u8, size as usize) {
-        return None;
+    // A streamed mip may arrive before either end of the texture. Staging
+    // copies resident bytes and supplies zeros for the missing pages.
+    if !cfg!(test) && !crate::texture::any_resident(address as *const u8, size as usize) {
+        return Err(size);
     }
     let mut out = std::ptr::null();
     // Outside the lock: making one takes a while.
@@ -1767,23 +1768,23 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     );
     LARGEST.set(0);
     if made != S_OK {
-        return None;
+        return Err(size);
     }
     if resource(out).host.is_none() {
         resource_release(out);
-        return None;
+        return Err(size);
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
         drop(map);
         resource_release(out);
-        return Some(r as This);
+        return Ok(r as This);
     }
     PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(out as usize);
     PLACED_LONGEST.fetch_max(end - address, std::sync::atomic::Ordering::AcqRel);
     map.insert((address, *desc), (out as usize, end));
     crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    Some(out)
+    Ok(out)
 }
 
 /// What is done about textures whose title memory changes
