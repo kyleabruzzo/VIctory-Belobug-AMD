@@ -2294,7 +2294,9 @@ impl HostHeap {
                     self.set_unmapped_null(index, &view);
                     return Some(slot);
                 }
-                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
+                let placed = try_placed_texture(&view);
+                let span = placed.as_ref().err().copied().filter(|&n| n > 0).unwrap_or(4 << 20);
+                if let Ok(shader_view @ View::Shader(tex_res, _)) = placed
                     && let Some(host_tex) =
                         crate::resource::host_resource(tex_res as crate::object::This)
                 {
@@ -2306,9 +2308,9 @@ impl HostHeap {
                     slot.retained = Some(host_tex.clone());
                 } else {
                     self.set_unmapped_null(index, &view);
-                    // Its pages may come later.
+                    // Its first resident mip may arrive far into a large texture.
                     slot.unmapped = true;
-                    slot.at = (address, address + (4 << 20));
+                    slot.at = (address, address.saturating_add(span));
                 }
             }
             _ => {
@@ -3038,18 +3040,22 @@ fn largest_mip(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
+    try_placed_texture(view).ok()
+}
+
+fn try_placed_texture(view: &View) -> Result<View, u64> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
-        return None;
+        return Err(0);
     };
     if resource[0] == BUFFER {
-        return None;
+        return Err(0);
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     #[cfg(feature = "diagnostics")]
     crate::texture::flips::view(address, resource, *desc);
     let texture = crate::resource::texture_at(address, resource, largest_mip(resource, desc))?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    Ok(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -4067,8 +4073,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             0,
         ];
 
-        assert!(crate::resource::texture_at(addr_a, &desc, 0).is_some());
-        assert!(crate::resource::texture_at(addr_b, &desc, 0).is_some());
+        assert!(crate::resource::texture_at(addr_a, &desc, 0).is_ok());
+        assert!(crate::resource::texture_at(addr_b, &desc, 0).is_ok());
         assert!(crate::resource::has_placed_texture(addr_a, &desc));
         assert!(crate::resource::has_placed_texture(addr_b, &desc));
 

@@ -1717,11 +1717,12 @@ pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. On failure, reports
+/// the guest byte span to watch for a subsequent mapping, when known.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Result<This, u64> {
     if address == 0 {
-        return None;
+        return Err(0);
     }
     // The description's padding holds anything; the same texture was made
     // up to four times for it. It holds the largest mip here.
@@ -1732,15 +1733,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
-        return None;
+        return Err(0);
     }
     if let Some(target) = target_at(address, &d) {
-        return Some(target);
+        return Ok(target);
     }
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
-            return Some(r as This);
+            return Ok(r as This);
         }
     }
     let size = match texture_layout(&d) {
@@ -1751,7 +1752,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     // A streamed mip may arrive before either end of the texture. Staging
     // copies resident bytes and supplies zeros for the missing pages.
     if !cfg!(test) && !crate::texture::any_resident(address as *const u8, size as usize) {
-        return None;
+        return Err(size);
     }
     let mut out = std::ptr::null();
     // Outside the lock: making one takes a while.
@@ -1767,23 +1768,23 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     );
     LARGEST.set(0);
     if made != S_OK {
-        return None;
+        return Err(size);
     }
     if resource(out).host.is_none() {
         resource_release(out);
-        return None;
+        return Err(size);
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
         drop(map);
         resource_release(out);
-        return Some(r as This);
+        return Ok(r as This);
     }
     PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(out as usize);
     PLACED_LONGEST.fetch_max(end - address, std::sync::atomic::Ordering::AcqRel);
     map.insert((address, *desc), (out as usize, end));
     crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    Some(out)
+    Ok(out)
 }
 
 /// What is done about textures whose title memory changes
