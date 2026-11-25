@@ -110,6 +110,15 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Several dirty kernel pages can describe one console page. Only adjacent
+/// duplicates are discarded, so the kernel's answer may be in any order.
+fn dirty_console_pages(addresses: &[usize]) -> impl Iterator<Item = usize> + '_ {
+    let mut previous = None;
+    addresses.iter().map(|&at| at / PAGE).filter(move |&page| {
+        previous.replace(page) != Some(page)
+    })
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -154,8 +163,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in dirty_console_pages(&j.found[..count]).chain(guarded) {
         j.written.insert(page, now);
     }
     Some((
@@ -1015,6 +1023,15 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dirty_console_pages_fold_kernel_pages_without_losing_reordered_answers() {
+        let consecutive: Vec<_> = (0..2 * PAGE).step_by(KERNEL_PAGE).collect();
+        assert_eq!(dirty_console_pages(&consecutive).collect::<Vec<_>>(), [0, 1]);
+        let reordered = [2 * PAGE, PAGE, PAGE + KERNEL_PAGE, 2 * PAGE + KERNEL_PAGE, 0];
+        assert_eq!(dirty_console_pages(&reordered).collect::<Vec<_>>(), [2, 1, 2, 0]);
+        assert_eq!(dirty_console_pages(&[]).next(), None);
+    }
 
     /// The bit set answers as a tree does, ranges across chunks included.
     #[test]
